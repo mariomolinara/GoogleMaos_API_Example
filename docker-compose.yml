@@ -1,0 +1,15 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: cassitrack-mqtt
+    ports:
+      - "1883:1883"   # MQTT (ESP32 + Spring Boot subscriber connect here)
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
