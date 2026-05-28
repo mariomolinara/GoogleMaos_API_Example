@@ -1,7 +1,8 @@
 package it.unicas.spring.googleapi.demo.mqtt;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import it.unicas.spring.googleapi.demo.config.RouteConfiguration;
+import it.unicas.spring.googleapi.demo.config.BusLineConfig;
+import it.unicas.spring.googleapi.demo.config.FleetConfiguration;
 import it.unicas.spring.googleapi.demo.model.GpsData;
 import it.unicas.spring.googleapi.demo.model.RouteStop;
 import it.unicas.spring.googleapi.demo.util.GeoUtils;
@@ -11,49 +12,47 @@ import org.eclipse.paho.client.mqttv3.*;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.DependsOn;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
 /**
- * Simulatore ESP32 con modulo GPS.
+ * ESP32 GPS Simulator — substitutes real hardware during development and demos.
  *
- * Simula un ESP32 montato su un autobus che:
- *  1. Legge posizione GPS (NMEA da u-blox NEO-6M via UART2)
- *  2. Calcola velocita' dalla frase $GPRMC (knots * 1.852 = km/h)
- *  3. Conta passeggeri con sensore IR sul portellone (crowding 0-10)
- *  4. Pubblica JSON via MQTT ogni 10 secondi
+ * Simulates one bus per line defined in FleetConfiguration (application.properties).
+ * Each bus travels along its route by linearly interpolating between consecutive stops.
+ * Every 10 seconds (configurable) all buses publish a JSON GPS payload to the MQTT broker.
  *
- * Il bus percorre il tragitto interpolando linearmente tra le fermate
- * definite in application.properties.
+ * The published JSON matches the payload that the real Heltec WiFi LoRa 32 V4 +
+ * Quectel L76K hardware would send:
+ *   { busId, latitude, longitude, timestamp, speedKmh, bearing, crowding,
+ *     gpsAccuracyMeters, nextStopIndex }
  *
- * === CODICE EQUIVALENTE ESP32 (Arduino/PubSubClient) ===
- * void loop() {
- *   if (gps.encode(GPSSerial.read())) {
+ * To disable the simulator and use real hardware instead, set:
+ *   simulator.enabled=false
+ * in application.properties.
+ *
+ * Equivalent Arduino/PubSubClient sketch (real ESP32):
+ *   void loop() {
  *     if (gps.location.isValid()) {
- *       String payload = "{\"busId\":\"" + BUS_ID + "\"," +
- *         "\"latitude\":" + gps.location.lat() + "," +
- *         "\"longitude\":" + gps.location.lng() + "," +
- *         "\"timestamp\":" + millis() + "," +
- *         "\"speedKmh\":" + gps.speed.kmph() + "," +
- *         "\"bearing\":" + gps.course.deg() + "," +
- *         "\"crowding\":" + getCrowdingLevel() + "}";
+ *       float speed = gps.speed.kmph();   // read from $GNRMC sentence
+ *       float bear  = gps.course.deg();   // read from $GNRMC sentence
+ *       String payload = buildJson(gps.location.lat(), gps.location.lng(), speed, bear, crowding);
  *       mqttClient.publish("omnitrack/bus/gps", payload.c_str());
  *     }
  *   }
- * }
  */
 @Component
-@DependsOn("embeddedMqttBroker")
 public class Esp32GpsSimulator {
 
     private static final Logger log = LoggerFactory.getLogger(Esp32GpsSimulator.class);
 
-    // Numero di step di simulazione tra una fermata e la successiva
+    /** Interpolation steps between two consecutive stops. Controls granularity of movement. */
     private static final int STEPS_PER_SEGMENT = 20;
 
     @Value("${mqtt.broker.host:localhost}")
@@ -65,74 +64,97 @@ public class Esp32GpsSimulator {
     @Value("${mqtt.topic.gps:omnitrack/bus/gps}")
     private String gpsTopic;
 
-    @Value("${mqtt.client.publisher.id:esp32-sim}")
+    @Value("${mqtt.client.publisher.id:esp32-simulator-pub}")
     private String publisherClientId;
-
-    @Value("${simulator.bus.id:BUS-CASSINO-001}")
-    private String busId;
 
     @Value("${simulator.enabled:true}")
     private boolean simulatorEnabled;
 
-    private final RouteConfiguration routeConfig;
+    private final FleetConfiguration fleetConfig;
     private final ObjectMapper objectMapper;
 
     private MqttClient mqttPublisher;
-    private int currentStep = 0;       // step corrente nella sequenza del tragitto
-    private int totalSteps = 0;        // numero totale di step
-    private double prevLat, prevLon;   // posizione precedente (per calcolo bearing real-time)
     private final Random random = new Random();
 
-    // Traiettoria completa: lista di coordinate interpolate
-    private double[] routeLats;
-    private double[] routeLons;
+    /**
+     * Per-bus simulation state — one instance per bus line in the fleet.
+     */
+    private static class BusSimState {
+        final String       busId;
+        final BusLineConfig lineConfig;
+        int    currentStep        = 0;
+        int    totalSteps         = 0;
+        double[] routeLats;
+        double[] routeLons;
+        double prevLat, prevLon;
+        int    currentCrowding    = 0;
+        int    lastCrowdingSegment = -1;
 
-    public Esp32GpsSimulator(RouteConfiguration routeConfig, ObjectMapper objectMapper) {
-        this.routeConfig = routeConfig;
+        BusSimState(String busId, BusLineConfig lineConfig) {
+            this.busId      = busId;
+            this.lineConfig = lineConfig;
+        }
+    }
+
+    /** All active bus simulators, keyed by busId. */
+    private final Map<String, BusSimState> busStates = new LinkedHashMap<>();
+
+    public Esp32GpsSimulator(FleetConfiguration fleetConfig, ObjectMapper objectMapper) {
+        this.fleetConfig  = fleetConfig;
         this.objectMapper = objectMapper;
     }
 
     @PostConstruct
     public void init() {
         if (!simulatorEnabled) {
-            log.info("Simulatore ESP32 disabilitato (simulator.enabled=false).");
+            log.info("ESP32 simulator disabled (simulator.enabled=false).");
             return;
         }
 
-        // Costruisci traiettoria interpolata tra le fermate
-        buildRoute();
-
-        // Connetti il publisher MQTT
-        try {
-            String brokerUrl = "tcp://" + brokerHost + ":" + brokerPort;
-            mqttPublisher = new MqttClient(brokerUrl, publisherClientId, new MemoryPersistence());
-            MqttConnectOptions opts = new MqttConnectOptions();
-            opts.setAutomaticReconnect(true);
-            opts.setCleanSession(true);
-            mqttPublisher.connect(opts);
-            log.info(">>> Simulatore ESP32 connesso a {} - pubblicazione su topic: {}", brokerUrl, gpsTopic);
-        } catch (MqttException e) {
-            log.error("Errore connessione MQTT publisher (simulatore): {}", e.getMessage(), e);
+        // Build interpolated trajectory for each bus line in the fleet
+        List<BusLineConfig> buses = fleetConfig.getBuses();
+        if (buses.isEmpty()) {
+            log.warn("No buses configured in fleet. Check application.properties (fleet.buses[*]).");
+            return;
         }
+
+        for (int i = 0; i < buses.size(); i++) {
+            BusLineConfig line  = buses.get(i);
+            BusSimState   state = new BusSimState(line.getBusId(), line);
+            buildRoute(state, i, buses.size());
+            busStates.put(line.getBusId(), state);
+            log.info("Simulator initialized for bus={} line={} ({} steps)",
+                    line.getBusId(), line.getLineId(), state.totalSteps);
+        }
+
+        // Connect MQTT publisher with retry (broker may still be starting when embedded)
+        connectWithRetry();
     }
 
     /**
-     * Genera la sequenza di coordinate interpolate lungo il percorso.
+     * Builds the interpolated coordinate array for a single bus.
+     * Buses are offset in the route so they appear at different positions at startup.
+     *
+     * @param state   per-bus state to populate
+     * @param busIdx  index of this bus in the fleet (used to compute start offset)
+     * @param total   total number of buses in the fleet
      */
-    private void buildRoute() {
-        List<RouteStop> stops = routeConfig.getStops();
+    private void buildRoute(BusSimState state, int busIdx, int total) {
+        List<RouteStop> stops = state.lineConfig.getStops();
         if (stops == null || stops.size() < 2) {
-            log.warn("Fermate insufficienti per costruire il percorso (min 2). Verifica application.properties.");
-            routeLats = new double[]{41.4912};
-            routeLons = new double[]{13.8306};
-            totalSteps = 1;
+            log.warn("Bus {} has fewer than 2 stops — cannot interpolate route.", state.busId);
+            state.routeLats  = new double[]{stops != null && !stops.isEmpty()
+                    ? stops.get(0).getLatitude() : 41.4912};
+            state.routeLons  = new double[]{stops != null && !stops.isEmpty()
+                    ? stops.get(0).getLongitude() : 13.8306};
+            state.totalSteps = 1;
             return;
         }
 
-        int segments = stops.size() - 1;
-        totalSteps = segments * STEPS_PER_SEGMENT;
-        routeLats = new double[totalSteps];
-        routeLons = new double[totalSteps];
+        int segments       = stops.size() - 1;
+        state.totalSteps   = segments * STEPS_PER_SEGMENT;
+        state.routeLats    = new double[state.totalSteps];
+        state.routeLons    = new double[state.totalSteps];
 
         int idx = 0;
         for (int s = 0; s < segments; s++) {
@@ -140,61 +162,101 @@ public class Esp32GpsSimulator {
             RouteStop to   = stops.get(s + 1);
             for (int step = 0; step < STEPS_PER_SEGMENT; step++) {
                 double t = (double) step / STEPS_PER_SEGMENT;
-                routeLats[idx] = GeoUtils.interpolate(from.getLatitude(),  to.getLatitude(),  t);
-                routeLons[idx] = GeoUtils.interpolate(from.getLongitude(), to.getLongitude(), t);
+                state.routeLats[idx] = GeoUtils.interpolate(from.getLatitude(),  to.getLatitude(),  t);
+                state.routeLons[idx] = GeoUtils.interpolate(from.getLongitude(), to.getLongitude(), t);
                 idx++;
             }
         }
 
-        // Punto di partenza per calcolo bearing iniziale
-        prevLat = routeLats[0];
-        prevLon = routeLons[0];
-
-        log.info("Percorso simulato: {} tappe, {} step totali ({}s ciascuno)",
-                stops.size(), totalSteps, 10);
+        // Stagger start positions so buses appear spread across the route at startup
+        state.currentStep = (total > 1) ? (busIdx * state.totalSteps / total) : 0;
+        state.prevLat     = state.routeLats[state.currentStep];
+        state.prevLon     = state.routeLons[state.currentStep];
     }
 
     /**
-     * Pubblicazione MQTT ogni 10 secondi (configurabile via simulator.update.interval.ms).
-     * Simula l'ESP32 che invia la posizione GPS corrente.
+     * Attempts to connect the MQTT publisher with exponential back-off (up to 5 attempts).
+     * This avoids the hard @DependsOn("embeddedMqttBroker") which is incompatible
+     * with an external Docker broker that may not be a Spring bean.
      */
-    @Scheduled(fixedRateString = "${simulator.update.interval.ms:10000}",
-               initialDelay   = 3000)       // attende 3s all'avvio
+    private void connectWithRetry() {
+        String brokerUrl = "tcp://" + brokerHost + ":" + brokerPort;
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            try {
+                mqttPublisher = new MqttClient(brokerUrl, publisherClientId, new MemoryPersistence());
+                MqttConnectOptions opts = new MqttConnectOptions();
+                opts.setAutomaticReconnect(true);
+                opts.setCleanSession(true);
+                mqttPublisher.connect(opts);
+                log.info(">>> ESP32 Simulator connected to {} — publishing on topic: {}",
+                        brokerUrl, gpsTopic);
+                return;
+            } catch (MqttException e) {
+                log.warn("MQTT connect attempt {}/5 failed: {}. Retrying…", attempt, e.getMessage());
+                try { Thread.sleep(1000L * attempt); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        log.error("ESP32 Simulator could not connect to MQTT broker at {}. Simulation disabled.", brokerUrl);
+    }
+
+    /**
+     * Scheduled GPS publish — fires every `simulator.update.interval.ms` (default 10 s).
+     * Each call publishes one MQTT message per bus in the fleet.
+     */
+    @Scheduled(fixedRateString = "${simulator.update.interval.ms:10000}", initialDelay = 3000)
     public void publishGpsPosition() {
         if (!simulatorEnabled || mqttPublisher == null || !mqttPublisher.isConnected()) return;
-        if (totalSteps == 0) return;
 
-        double lat = routeLats[currentStep];
-        double lon = routeLons[currentStep];
-
-        // Calcolo bearing reale dalla posizione precedente
-        double bearing = 0.0;
-        if (currentStep > 0) {
-            bearing = GeoUtils.bearingDegrees(prevLat, prevLon, lat, lon);
+        for (BusSimState busState : busStates.values()) {
+            publishBusPosition(busState);
         }
+    }
 
-        // Calcolo velocita' in km/h (distanza / tempo, come farebbe il GPS NMEA $GPRMC)
-        double distMeters = GeoUtils.distanceMeters(prevLat, prevLon, lat, lon);
-        double speedKmh = (distMeters / 10.0) * 3.6;  // 10s tra i messaggi
-        // Aggiungi rumore realistico (±5%)
-        speedKmh = speedKmh * (0.95 + random.nextDouble() * 0.10);
+    /** Publishes one GPS message for a single bus and advances its step counter. */
+    private void publishBusPosition(BusSimState bs) {
+        if (bs.totalSteps == 0) return;
+
+        double lat = bs.routeLats[bs.currentStep];
+        double lon = bs.routeLons[bs.currentStep];
+
+        // Bearing from the previous position (real GPS gives this via $GNRMC)
+        double bearing = (bs.currentStep > 0)
+                ? GeoUtils.bearingDegrees(bs.prevLat, bs.prevLon, lat, lon) : 0.0;
+
+        // Speed: Δdistance / Δtime  (real GPS gives this via $GNRMC — speed over ground)
+        double distMeters = GeoUtils.distanceMeters(bs.prevLat, bs.prevLon, lat, lon);
+        double speedKmh   = (distMeters / 10.0) * 3.6;           // 10 s between messages
+        speedKmh = speedKmh * (0.95 + random.nextDouble() * 0.10); // ±5 % noise
         speedKmh = Math.max(0, Math.min(speedKmh, 80.0));
 
-        // Affollamento: simulato con variazione graduale (sensore porta)
-        int crowding = simulateCrowding(currentStep);
+        // Determine current segment and next stop index (deterministic — avoids proximity oscillation)
+        int totalSegments  = bs.lineConfig.getStops().size() - 1;
+        int currentSegment = (totalSegments > 0) ? (bs.currentStep / STEPS_PER_SEGMENT) : 0;
+        int nextStopIdx    = Math.min(currentSegment + 1, bs.lineConfig.getStops().size() - 1);
 
-        // Accuratezza GPS tipica: 3-8 metri con cielo libero (HDOP < 2)
-        double accuracy = 3.0 + random.nextDouble() * 5.0;
+        // Crowding: updated only when the bus enters a new segment (i.e., reaches a stop)
+        if (currentSegment != bs.lastCrowdingSegment) {
+            bs.currentCrowding    = simulateCrowding(currentSegment, totalSegments);
+            bs.lastCrowdingSegment = currentSegment;
+            log.info("[{}] Stop reached → segment {} → crowding updated to {}/10",
+                    bs.busId, currentSegment, bs.currentCrowding);
+        }
+
+        double accuracy = 3.0 + random.nextDouble() * 5.0; // GPS accuracy 3–8 m (HDOP < 2)
 
         GpsData data = new GpsData();
-        data.setBusId(busId);
+        data.setBusId(bs.busId);
         data.setLatitude(lat);
         data.setLongitude(lon);
         data.setTimestamp(System.currentTimeMillis());
         data.setSpeedKmh(Math.round(speedKmh * 10.0) / 10.0);
         data.setBearing(Math.round(bearing * 10.0) / 10.0);
-        data.setCrowding(crowding);
+        data.setCrowding(bs.currentCrowding);
         data.setGpsAccuracyMeters(Math.round(accuracy * 10.0) / 10.0);
+        data.setNextStopIndex(nextStopIdx);
 
         try {
             String json = objectMapper.writeValueAsString(data);
@@ -202,26 +264,36 @@ public class Esp32GpsSimulator {
             msg.setQos(1);
             msg.setRetained(false);
             mqttPublisher.publish(gpsTopic, msg);
-            log.info("[ESP32 -> MQTT] step={}/{} lat=%.6f lon=%.6f speed=%.1fkm/h crowding={}".formatted(
-                    currentStep + 1, totalSteps, lat, lon, data.getSpeedKmh(), data.getCrowding()));
+
+            log.info("[{} → MQTT] step={}/{} seg={} lat={} lon={} speed={}km/h bear={}° crowd={}/10 nextStop={}",
+                    bs.busId, bs.currentStep + 1, bs.totalSteps, currentSegment,
+                    String.format(java.util.Locale.US, "%.6f", lat),
+                    String.format(java.util.Locale.US, "%.6f", lon),
+                    String.format(java.util.Locale.US, "%.1f", speedKmh),
+                    String.format(java.util.Locale.US, "%.1f", bearing),
+                    bs.currentCrowding, nextStopIdx);
         } catch (Exception e) {
-            log.error("Errore pubblicazione MQTT: {}", e.getMessage(), e);
+            log.error("MQTT publish error for bus {}: {}", bs.busId, e.getMessage(), e);
         }
 
-        // Aggiorna posizione precedente e avanza al prossimo step (circolare)
-        prevLat = lat;
-        prevLon = lon;
-        currentStep = (currentStep + 1) % totalSteps;
+        // Advance step (wraps at end of route → bus loops continuously)
+        bs.prevLat    = lat;
+        bs.prevLon    = lon;
+        bs.currentStep = (bs.currentStep + 1) % bs.totalSteps;
     }
 
     /**
-     * Simula il livello di affollamento in base alla posizione nel percorso.
-     * In un sistema reale, questo valore viene dal contatore di passeggeri a bordo.
+     * Simulates the crowding level when the bus enters a new route segment (= reaches a stop).
+     * Models a bell-curve load: nearly empty at start and end, busiest at mid-route.
+     *
+     * @param segment       current segment index (0 = first leg)
+     * @param totalSegments total number of legs in the route
+     * @return crowding level 0–10
      */
-    private int simulateCrowding(int step) {
-        double progress = (double) step / totalSteps;
-        // Bus si riempie a meta' percorso, si svuota verso la fine
-        int base = (int) (10 * 4 * progress * (1 - progress)); // campana gaussiana
+    private int simulateCrowding(int segment, int totalSegments) {
+        if (totalSegments <= 0) return 0;
+        double progress = (double) segment / totalSegments;
+        int base = (int) (10 * 4 * progress * (1 - progress)); // bell curve
         return Math.max(0, Math.min(10, base + random.nextInt(3) - 1));
     }
 
@@ -230,10 +302,10 @@ public class Esp32GpsSimulator {
         try {
             if (mqttPublisher != null && mqttPublisher.isConnected()) {
                 mqttPublisher.disconnect();
-                log.info("Simulatore ESP32 disconnesso.");
+                log.info("ESP32 simulator disconnected.");
             }
         } catch (MqttException e) {
-            log.error("Errore disconnessione simulatore: {}", e.getMessage());
+            log.error("Error disconnecting ESP32 simulator: {}", e.getMessage());
         }
     }
 }

@@ -9,20 +9,24 @@ import org.eclipse.paho.client.mqttv3.*;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.DependsOn;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
- * Subscriber MQTT (Eclipse Paho v3).
- * Si connette al broker embedded e resta in ascolto sul topic GPS.
- * Ogni messaggio ricevuto viene deserializzato da JSON (GpsData)
- * e passato al VehicleStateService per l'elaborazione.
+ * MQTT subscriber (Eclipse Paho v3).
  *
- * Questo simula il server OmniTrack che riceve i dati dall'ESP32.
+ * Connects to the MQTT broker (embedded Moquette or external Mosquitto via Docker)
+ * and listens on the GPS topic. Each incoming message is deserialized from JSON
+ * into a GpsData object and forwarded to VehicleStateService for processing.
+ *
+ * The @DependsOn annotation has been intentionally removed so that this subscriber
+ * works with both the embedded broker (Spring bean) and an external Docker broker
+ * (not a Spring bean). Connection retries with exponential back-off handle the case
+ * where the broker is not yet available at startup.
+ *
+ * This simulates the OmniTrack server receiving data from the ESP32 fleet.
  */
 @Component
-@DependsOn("embeddedMqttBroker")
 public class MqttSubscriberService {
 
     private static final Logger log = LoggerFactory.getLogger(MqttSubscriberService.class);
@@ -46,63 +50,68 @@ public class MqttSubscriberService {
 
     public MqttSubscriberService(VehicleStateService vehicleStateService, ObjectMapper objectMapper) {
         this.vehicleStateService = vehicleStateService;
-        this.objectMapper = objectMapper;
+        this.objectMapper        = objectMapper;
     }
 
     @PostConstruct
     public void connect() {
-        try {
-            String brokerUrl = "tcp://" + brokerHost + ":" + brokerPort;
-            mqttClient = new MqttClient(brokerUrl, clientId, new MemoryPersistence());
+        String brokerUrl = "tcp://" + brokerHost + ":" + brokerPort;
 
-            MqttConnectOptions options = new MqttConnectOptions();
-            options.setAutomaticReconnect(true);
-            options.setCleanSession(true);
-            options.setConnectionTimeout(10);
-            options.setKeepAliveInterval(30);
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            try {
+                mqttClient = new MqttClient(brokerUrl, clientId, new MemoryPersistence());
 
-            mqttClient.setCallback(new MqttCallback() {
+                MqttConnectOptions options = new MqttConnectOptions();
+                options.setAutomaticReconnect(true);
+                options.setCleanSession(true);
+                options.setConnectionTimeout(10);
+                options.setKeepAliveInterval(30);
 
-                @Override
-                public void connectionLost(Throwable cause) {
-                    log.warn("Connessione MQTT persa: {}. Riconnessione automatica...", cause.getMessage());
+                mqttClient.setCallback(new MqttCallback() {
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        log.warn("MQTT connection lost: {}. Auto-reconnect active.", cause.getMessage());
+                    }
+                    @Override
+                    public void messageArrived(String topic, MqttMessage message) {
+                        handleGpsMessage(topic, message.getPayload());
+                    }
+                    @Override
+                    public void deliveryComplete(IMqttDeliveryToken token) {
+                        // not used by subscriber
+                    }
+                });
+
+                mqttClient.connect(options);
+                // Wildcard subscription: receives GPS messages from every bus on the topic
+                mqttClient.subscribe(gpsTopic, 1);
+
+                log.info(">>> MQTT Subscriber connected to {} — listening on topic: {}", brokerUrl, gpsTopic);
+                return;
+
+            } catch (MqttException e) {
+                log.warn("MQTT subscriber connect attempt {}/5 failed: {}. Retrying…", attempt, e.getMessage());
+                try { Thread.sleep(1000L * attempt); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
-
-                @Override
-                public void messageArrived(String topic, MqttMessage message) {
-                    handleGpsMessage(topic, message.getPayload());
-                }
-
-                @Override
-                public void deliveryComplete(IMqttDeliveryToken token) {
-                    // non usato nel subscriber
-                }
-            });
-
-            mqttClient.connect(options);
-            // Sottoscrivi con wildcard per ricevere tutti i bus
-            mqttClient.subscribe(gpsTopic, 1);
-
-            log.info(">>> MQTT Subscriber connesso a {} - in ascolto su topic: {}", brokerUrl, gpsTopic);
-
-        } catch (MqttException e) {
-            log.error("Errore connessione MQTT subscriber: {}", e.getMessage(), e);
+            }
         }
+        log.error("MQTT Subscriber could not connect to broker at {} after 5 attempts.", brokerUrl);
     }
 
     private void handleGpsMessage(String topic, byte[] payload) {
         try {
             String json = new String(payload);
-            log.debug("MQTT ricevuto [{}]: {}", topic, json);
+            log.debug("MQTT received [{}]: {}", topic, json);
 
             GpsData gpsData = objectMapper.readValue(json, GpsData.class);
-            log.info("GPS ricevuto da ESP32 → {}", gpsData);
+            log.info("GPS received ← {}", gpsData);
 
-            // Elaborazione: aggiorna stato veicolo, calcola ETA, ecc.
             vehicleStateService.processGpsData(gpsData);
 
         } catch (Exception e) {
-            log.error("Errore parsing messaggio GPS MQTT: {}", e.getMessage(), e);
+            log.error("Error parsing MQTT GPS message: {}", e.getMessage(), e);
         }
     }
 
@@ -111,11 +120,10 @@ public class MqttSubscriberService {
         try {
             if (mqttClient != null && mqttClient.isConnected()) {
                 mqttClient.disconnect();
-                log.info("MQTT Subscriber disconnesso.");
+                log.info("MQTT Subscriber disconnected.");
             }
         } catch (MqttException e) {
-            log.error("Errore disconnessione MQTT: {}", e.getMessage());
+            log.error("Error disconnecting MQTT subscriber: {}", e.getMessage());
         }
     }
 }
-

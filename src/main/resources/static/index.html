@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -24,6 +24,17 @@
         h2 { font-size: 0.95em; color: #90caf9; text-transform: uppercase;
              letter-spacing: 1px; margin-bottom: 12px; padding-bottom: 6px;
              border-bottom: 1px solid #2a3a5e; }
+
+        /* Bus selector */
+        .bus-selector { margin-bottom: 12px; }
+        .bus-selector label { font-size: 0.7em; color: #90caf9; text-transform: uppercase; }
+        .bus-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+        .bus-tab {
+            padding: 4px 10px; border-radius: 12px; font-size: 0.78em; font-weight: bold;
+            cursor: pointer; border: 2px solid transparent; transition: all 0.2s;
+        }
+        .bus-tab.active { border-color: #fff; }
+
         .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
         .stat { background: #0f3460; border-radius: 6px; padding: 10px; }
         .stat .label { font-size: 0.7em; color: #90caf9; text-transform: uppercase; margin-bottom: 4px; }
@@ -34,26 +45,29 @@
         .bar-track { background: #1a1a2e; border-radius: 4px; height: 16px; overflow: hidden; }
         .bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
         .stop-info { background: #0f3460; border-radius: 6px; padding: 10px; margin-bottom: 16px; }
-        .stop-info .stop-name { font-size: 1em; font-weight: bold; color: #ffcc02; margin-bottom: 4px; }
-        .stop-info .eta { font-size: 0.85em; color: #aaa; }
+        .stop-info .stop-name { font-size: 1em; font-weight: bold; color: #ffcc02; margin-bottom: 8px; }
+        .eta-card { background: #0a2040; border: 1px solid #1e4080; border-radius: 6px; padding: 10px; margin-top: 8px; }
+        .eta-countdown { font-size: 2.4em; font-weight: bold; color: #4fc3f7; letter-spacing: 2px; text-align: center; line-height: 1.1; }
+        .eta-countdown .eta-unit { font-size: 0.38em; color: #90caf9; font-weight: normal; }
+        .eta-arrival { text-align: center; margin-top: 4px; font-size: 0.78em; color: #aaa; }
+        .eta-arrival .eta-time-val { color: #80deea; font-weight: bold; font-size: 1.1em; }
+        .eta-source { display: inline-block; margin-top: 6px; font-size: 0.7em; padding: 2px 7px; border-radius: 8px; font-weight: bold; }
+        .eta-source.google    { background: #1b5e20; color: #a5d6a7; }
+        .eta-source.haversine { background: #1a237e; color: #90caf9; }
         .siri-section { margin-top: 4px; }
         #siri-status { font-size: 0.8em; color: #aaa; margin-bottom: 8px; }
         #siri-output {
             background: #0a0a1a; border: 1px solid #2a3a5e; border-radius: 6px;
             padding: 10px; font-family: 'Courier New', monospace; font-size: 0.7em;
-            color: #a5d6a7; height: 260px; overflow-y: auto; white-space: pre-wrap;
-            word-break: break-all;
+            color: #a5d6a7; height: 220px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
         }
         .connected { color: #4caf50 !important; }
         .waiting   { color: #ff9800 !important; }
-        .indicator {
-            display: inline-block; width: 8px; height: 8px;
-            border-radius: 50%; margin-right: 5px; background: #4caf50;
-            animation: pulse 1.5s infinite;
-        }
+        .indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: #4caf50; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
         .bus-icon { font-size: 1.6em; }
         .legend { font-size: 0.75em; color: #aaa; margin-top: 8px; }
+        .line-badge { font-size: 0.7em; padding: 1px 6px; border-radius: 6px; margin-left: 6px; }
     </style>
 </head>
 <body>
@@ -62,14 +76,22 @@
     <h1>OmniTrack CassiTrack</h1>
     <span class="badge">SIRI 2.0</span>
     <span style="margin-left:auto; font-size:0.8em; color:#90caf9;">
-        Linea 1 – Cassino (FR) · COTRAL
+        Fleet Monitor · Cassino (FR) · COTRAL
     </span>
 </header>
 
 <div class="container">
-    <!-- Pannello sinistro: dati bus -->
+    <!-- Left panel: bus data -->
     <div class="panel">
-        <h2>📡 Stato Veicolo (ESP32 + GPS)</h2>
+        <h2>📡 Vehicle State (ESP32 + GPS)</h2>
+
+        <!-- Bus selector tabs -->
+        <div class="bus-selector">
+            <div class="label">Active Bus</div>
+            <div class="bus-tabs" id="bus-tabs">
+                <span style="font-size:0.8em;color:#666">Waiting for GPS data…</span>
+            </div>
+        </div>
 
         <div class="stat-grid">
             <div class="stat">
@@ -77,228 +99,337 @@
                 <div class="value" id="bus-id" style="font-size:0.9em">–</div>
             </div>
             <div class="stat">
-                <div class="label">Velocità</div>
+                <div class="label">Speed</div>
                 <div class="value"><span id="speed">–</span> <span class="unit">km/h</span></div>
             </div>
             <div class="stat">
-                <div class="label">Latitudine</div>
+                <div class="label">Latitude</div>
                 <div class="value" id="lat" style="font-size:0.85em">–</div>
             </div>
             <div class="stat">
-                <div class="label">Longitudine</div>
+                <div class="label">Longitude</div>
                 <div class="value" id="lon" style="font-size:0.85em">–</div>
             </div>
             <div class="stat">
-                <div class="label">Direzione</div>
+                <div class="label">Bearing</div>
                 <div class="value"><span id="bearing">–</span> <span class="unit">°</span></div>
             </div>
             <div class="stat">
-                <div class="label">Ultimo Aggiorn.</div>
+                <div class="label">Last Update</div>
                 <div class="value" id="last-update" style="font-size:0.7em">–</div>
             </div>
         </div>
 
-        <!-- Affollamento -->
+        <!-- Crowding -->
         <div class="crowding-bar">
-            <div class="label">Affollamento (Crowding) <span id="crowding-val">0/10</span></div>
+            <div class="label">Crowding <span id="crowding-val">0/10</span></div>
             <div class="bar-track">
                 <div class="bar-fill" id="crowding-bar" style="width:0%;background:#4caf50"></div>
             </div>
             <div class="legend" id="occupancy-label">–</div>
         </div>
 
-        <!-- Prossima fermata -->
+        <!-- Next stop & ETA -->
         <div class="stop-info">
             <div class="label" style="font-size:0.7em;color:#90caf9;text-transform:uppercase;margin-bottom:4px">
-                📍 Prossima Fermata
+                📍 Next Stop
             </div>
-            <div class="stop-name" id="next-stop-name">In attesa dati GPS...</div>
-            <div class="eta" id="eta-text">ETA: –</div>
+            <div class="stop-name" id="next-stop-name">Waiting for GPS data…</div>
+            <div class="eta-card" id="eta-card">
+                <div class="eta-countdown" id="eta-countdown">
+                    <span id="eta-display">–</span><span class="eta-unit" id="eta-unit"> min</span>
+                </div>
+                <div class="eta-arrival">
+                    Expected arrival at <span class="eta-time-val" id="eta-arrival-time">–</span>
+                </div>
+                <div style="text-align:center">
+                    <span class="eta-source" id="eta-source-badge">–</span>
+                </div>
+            </div>
         </div>
 
-        <!-- Client SSE attivi -->
+        <!-- SSE clients -->
         <div style="font-size:0.8em; color:#aaa; margin-bottom:12px;">
             <span class="indicator"></span>
-            SSE Client attivi: <span id="sse-clients" class="connected">–</span>
+            Active SSE clients: <span id="sse-clients" class="connected">–</span>
         </div>
 
-        <!-- Stream SIRI -->
+        <!-- SIRI stream -->
         <div class="siri-section">
-            <h2>📨 Stream SIRI 2.0</h2>
-            <div id="siri-status" class="waiting">⏳ Connessione SSE in corso...</div>
-            <div id="siri-output">// In attesa del primo messaggio SIRI 2.0...</div>
+            <h2>📨 SIRI 2.0 Stream</h2>
+            <div id="siri-status" class="waiting">⏳ Connecting to SSE feed…</div>
+            <div id="siri-output">// Waiting for first SIRI 2.0 message…</div>
         </div>
     </div>
 
-    <!-- Mappa -->
+    <!-- Map -->
     <div id="map"></div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 // =====================================================
-// Mappa Leaflet centrata su Cassino (FR)
+// Fleet colours — one per bus line
+// =====================================================
+const FLEET = {
+    'BUS-001': { color: '#2196f3', label: 'L1', emoji: '🚌' },
+    'BUS-002': { color: '#f44336', label: 'L2', emoji: '🚎' },
+    'BUS-003': { color: '#4caf50', label: 'L3', emoji: '🚐' },
+};
+
+function busColor(busId) { return (FLEET[busId] || {}).color || '#ffcc02'; }
+function busEmoji(busId) { return (FLEET[busId] || {}).emoji || '🚌'; }
+function busLabel(busId) { return (FLEET[busId] || {}).label || busId; }
+
+// =====================================================
+// Leaflet map
 // =====================================================
 const map = L.map('map').setView([41.4890, 13.8200], 14);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap Contributors',
-    maxZoom: 19
+    attribution: '© OpenStreetMap Contributors', maxZoom: 19
 }).addTo(map);
 
-// Icona bus personalizzata
-const busIcon = L.divIcon({
-    html: '<div style="font-size:28px;transform:translate(-12px,-24px)">🚌</div>',
-    className: '', iconAnchor: [0, 0]
-});
-
-const stopIcon = L.divIcon({
-    html: '<div style="font-size:18px;transform:translate(-9px,-18px)">🚏</div>',
-    className: '', iconAnchor: [0, 0]
-});
-
-let busMarker = null;
-let routePolyline = null;
-const stopMarkers = [];
+const busMarkers  = {};   // busId → Leaflet marker
+const routeLayers = {};   // busId → Leaflet polyline + stop markers
+let   allBusData  = {};   // busId → last status JSON
+let   selectedBus = null; // currently displayed bus ID
+let   etaEndTime  = null; // epoch ms of predicted arrival
 
 // =====================================================
-// Carica percorso (fermate) via REST
+// ETA live countdown (ticks every second)
 // =====================================================
-async function loadRoute() {
+function updateEtaCountdown() {
+    if (!etaEndTime) return;
+    const remaining = Math.max(0, Math.round((etaEndTime - Date.now()) / 1000));
+    const minutes   = Math.ceil(remaining / 60);
+    const displayEl = document.getElementById('eta-display');
+    const unitEl    = document.getElementById('eta-unit');
+    const el        = document.getElementById('eta-countdown');
+
+    if (remaining === 0)      { displayEl.textContent = 'AT STOP'; unitEl.textContent = ''; }
+    else if (remaining < 60)  { displayEl.textContent = '< 1';     unitEl.textContent = ' min'; }
+    else                      { displayEl.textContent = minutes;    unitEl.textContent = ' min'; }
+
+    el.style.color = remaining < 60 ? '#ef5350' : remaining < 180 ? '#ffa726' : '#4fc3f7';
+}
+setInterval(updateEtaCountdown, 1000);
+
+// =====================================================
+// Load all routes and draw stop markers + polylines
+// =====================================================
+async function loadRoutes() {
     try {
         const res  = await fetch('/api/omnitrack/route');
         const data = await res.json();
 
-        const latLngs = data.stops.map(s => [s.latitude, s.longitude]);
+        (data.lines || []).forEach(line => {
+            const busId  = line.busId;
+            const color  = busColor(busId);
+            const latLngs = line.stops.map(s => [s.latitude, s.longitude]);
 
-        // Disegna tracciato
-        routePolyline = L.polyline(latLngs, {
-            color: '#2196f3', weight: 4, opacity: 0.7, dashArray: '8,4'
-        }).addTo(map);
+            const poly = L.polyline(latLngs, {
+                color, weight: 3, opacity: 0.6, dashArray: '8,4'
+            }).addTo(map);
 
-        // Aggiungi marker fermate
-        data.stops.forEach(stop => {
-            const m = L.marker([stop.latitude, stop.longitude], { icon: stopIcon })
-                .addTo(map)
-                .bindPopup(`<b>${stop.name}</b><br>ID: ${stop.id}<br>Ordine: ${stop.order}`);
-            stopMarkers.push(m);
+            const stopMarkers = line.stops.map(stop =>
+                L.circleMarker([stop.latitude, stop.longitude], {
+                    radius: 5, color, fillColor: color, fillOpacity: 0.8, weight: 2
+                }).addTo(map)
+                 .bindPopup(`<b>${stop.name}</b><br>${line.lineName}<br>ID: ${stop.id}`)
+            );
+
+            routeLayers[busId] = { poly, stopMarkers };
         });
 
-        map.fitBounds(routePolyline.getBounds().pad(0.15));
+        if (Object.keys(routeLayers).length)
+            map.fitBounds(Object.values(routeLayers)[0].poly.getBounds().pad(0.25));
 
-    } catch (e) {
-        console.warn('Errore caricamento percorso:', e);
+    } catch (e) { console.warn('Error loading routes:', e); }
+}
+
+// =====================================================
+// Update bus marker position on the map
+// =====================================================
+function updateBusMarker(bus) {
+    const { latitude: lat, longitude: lon, busId } = bus;
+    if (!lat || !lon) return;
+
+    const color = busColor(busId);
+    const emoji = busEmoji(busId);
+
+    if (busMarkers[busId]) {
+        busMarkers[busId].setLatLng([lat, lon]);
+    } else {
+        const icon = L.divIcon({
+            html: `<div style="font-size:22px;color:${color};transform:translate(-10px,-20px)">${emoji}</div>`,
+            className: '', iconAnchor: [0, 0]
+        });
+        busMarkers[busId] = L.marker([lat, lon], { icon })
+            .addTo(map)
+            .bindPopup('');
+    }
+
+    busMarkers[busId].getPopup().setContent(
+        `<b>${busId}</b> — ${bus.lineName || ''}<br>` +
+        `Speed: ${Number(bus.speedKmh||0).toFixed(1)} km/h · Bearing: ${Number(bus.bearing||0).toFixed(0)}°<br>` +
+        `Crowding: ${bus.crowding}/10 · ETA: ${bus.etaToNextStopMinutes || 0} min`
+    );
+}
+
+// =====================================================
+// Render the detail panel for the selected bus
+// =====================================================
+function renderPanel(bus) {
+    if (!bus || bus.status === 'waiting') {
+        document.getElementById('next-stop-name').textContent = 'Waiting for GPS data…';
+        return;
+    }
+
+    document.getElementById('bus-id').textContent      = bus.busId || '–';
+    document.getElementById('speed').textContent        = Number(bus.speedKmh || 0).toFixed(1);
+    document.getElementById('lat').textContent          = Number(bus.latitude  || 0).toFixed(6);
+    document.getElementById('lon').textContent          = Number(bus.longitude || 0).toFixed(6);
+    document.getElementById('bearing').textContent      = Number(bus.bearing   || 0).toFixed(0);
+    document.getElementById('sse-clients').textContent  = bus.activeSseClients || 0;
+
+    const upd = bus.lastGpsUpdate
+        ? new Date(bus.lastGpsUpdate).toLocaleTimeString('it-IT') : '–';
+    document.getElementById('last-update').textContent = upd;
+
+    // Crowding
+    const c   = bus.crowding || 0;
+    const pct = (c / 10) * 100;
+    const col = c <= 3 ? '#4caf50' : c <= 6 ? '#ff9800' : '#f44336';
+    document.getElementById('crowding-val').textContent  = `${c}/10`;
+    const bar = document.getElementById('crowding-bar');
+    bar.style.width      = pct + '%';
+    bar.style.background = col;
+    document.getElementById('occupancy-label').textContent =
+        'SIRI Occupancy: ' + (bus.occupancySiri || '–');
+
+    // Next stop & ETA
+    if (bus.nextStop) {
+        document.getElementById('next-stop-name').textContent = bus.nextStop.name;
+
+        const etaSec   = bus.etaToNextStopSeconds || 0;
+        etaEndTime     = Date.now() + etaSec * 1000;
+        updateEtaCountdown();
+
+        const arrival  = bus.etaArrivalTime ? new Date(bus.etaArrivalTime) : new Date(etaEndTime);
+        document.getElementById('eta-arrival-time').textContent =
+            arrival.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+
+        const badge = document.getElementById('eta-source-badge');
+        if (bus.etaFromGoogleMaps) {
+            badge.textContent  = '🗺️ Google Maps Directions';
+            badge.className    = 'eta-source google';
+        } else {
+            badge.textContent  = '📐 Haversine Estimate';
+            badge.className    = 'eta-source haversine';
+        }
     }
 }
 
 // =====================================================
-// Aggiorna stato veicolo ogni 5 secondi (polling REST)
+// Rebuild the bus selector tabs
+// =====================================================
+function updateBusTabs(buses) {
+    const container = document.getElementById('bus-tabs');
+    const existing  = new Set([...container.querySelectorAll('.bus-tab')].map(el => el.dataset.bus));
+    const incoming  = new Set(buses.map(b => b.busId).filter(Boolean));
+
+    // Add new tabs
+    buses.filter(b => b.busId && !existing.has(b.busId)).forEach(bus => {
+        const color = busColor(bus.busId);
+        const tab   = document.createElement('span');
+        tab.className       = 'bus-tab';
+        tab.dataset.bus     = bus.busId;
+        tab.style.background = color + '33';
+        tab.style.color      = color;
+        tab.textContent      = `${busEmoji(bus.busId)} ${bus.busId}`;
+        tab.title            = bus.lineName || bus.busId;
+        tab.onclick          = () => selectBus(bus.busId);
+        container.appendChild(tab);
+    });
+
+    // If no bus selected yet, auto-select first
+    if (!selectedBus && buses.length) selectBus(buses[0].busId);
+}
+
+function selectBus(busId) {
+    selectedBus = busId;
+    document.querySelectorAll('.bus-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.bus === busId);
+    });
+    if (allBusData[selectedBus])
+        renderPanel(allBusData[selectedBus]);
+}
+
+// =====================================================
+// Poll /api/omnitrack/status every 5 seconds
 // =====================================================
 function updateStatus() {
     fetch('/api/omnitrack/status')
         .then(r => r.json())
-        .then(data => {
-            if (data.status === 'waiting') {
-                document.getElementById('next-stop-name').textContent = 'In attesa dati GPS...';
-                return;
-            }
+        .then(response => {
+            const buses = Array.isArray(response) ? response : [response];
+            const active = buses.filter(b => b.status === 'active');
 
-            // Aggiorna dati
-            document.getElementById('bus-id').textContent    = data.busId || '–';
-            document.getElementById('speed').textContent     = Number(data.speedKmh || 0).toFixed(1);
-            document.getElementById('lat').textContent       = Number(data.latitude || 0).toFixed(6);
-            document.getElementById('lon').textContent       = Number(data.longitude || 0).toFixed(6);
-            document.getElementById('bearing').textContent   = Number(data.bearing || 0).toFixed(0);
-            document.getElementById('sse-clients').textContent = data.activeSseClients || 0;
+            // Cache all data, update markers
+            active.forEach(bus => {
+                allBusData[bus.busId] = bus;
+                updateBusMarker(bus);
+            });
 
-            const upd = data.lastGpsUpdate
-                ? new Date(data.lastGpsUpdate).toLocaleTimeString('it-IT')
-                : '–';
-            document.getElementById('last-update').textContent = upd;
+            // Rebuild selector tabs
+            if (active.length) updateBusTabs(active);
 
-            // Crowding
-            const c = data.crowding || 0;
-            const pct = (c / 10) * 100;
-            const color = c <= 3 ? '#4caf50' : c <= 6 ? '#ff9800' : '#f44336';
-            document.getElementById('crowding-val').textContent = `${c}/10`;
-            const bar = document.getElementById('crowding-bar');
-            bar.style.width = pct + '%';
-            bar.style.background = color;
-            document.getElementById('occupancy-label').textContent =
-                'SIRI Occupancy: ' + (data.occupancySiri || '–');
-
-            // Prossima fermata e ETA
-            if (data.nextStop) {
-                document.getElementById('next-stop-name').textContent = data.nextStop.name;
-                const etaSec = data.etaToNextStopSeconds || 0;
-                const etaMin = Math.floor(etaSec / 60);
-                const etaSecRem = etaSec % 60;
-                document.getElementById('eta-text').textContent =
-                    `ETA: ${etaMin}min ${etaSecRem}s (${etaSec}s) · Google Maps + Haversine`;
-            }
-
-            // Aggiorna posizione bus sulla mappa
-            const lat = data.latitude, lon = data.longitude;
-            if (lat && lon) {
-                if (busMarker) {
-                    busMarker.setLatLng([lat, lon]);
-                } else {
-                    busMarker = L.marker([lat, lon], { icon: busIcon })
-                        .addTo(map)
-                        .bindPopup(`<b>${data.busId}</b><br>Speed: ${Number(data.speedKmh).toFixed(1)} km/h`);
-                }
-                busMarker.getPopup().setContent(
-                    `<b>${data.busId}</b><br>` +
-                    `Vel: ${Number(data.speedKmh).toFixed(1)}km/h · Dir: ${Number(data.bearing).toFixed(0)}°<br>` +
-                    `Crowding: ${data.crowding}/10`
-                );
-            }
+            // Refresh detail panel for selected bus
+            if (selectedBus && allBusData[selectedBus])
+                renderPanel(allBusData[selectedBus]);
         })
-        .catch(e => console.warn('Errore /status:', e));
+        .catch(e => console.warn('Error /status:', e));
 }
 
 // =====================================================
-// SSE: riceve messaggi SIRI 2.0 dal server
+// SSE: receive SIRI 2.0 messages
 // =====================================================
 function connectSse() {
     const output   = document.getElementById('siri-output');
     const statusEl = document.getElementById('siri-status');
-    let msgCount   = 0;
+    let   msgCount = 0;
 
     const es = new EventSource('/api/siri/stream');
 
     es.addEventListener('open', () => {
-        statusEl.textContent = '✅ Connesso al feed SSE SIRI 2.0';
-        statusEl.className = 'connected';
+        statusEl.textContent = '✅ Connected to SIRI 2.0 SSE feed';
+        statusEl.className   = 'connected';
     });
 
     es.addEventListener('siri-vehicle-monitoring', (event) => {
         msgCount++;
-        const ts  = new Date().toLocaleTimeString('it-IT');
-        statusEl.textContent = `✅ Messaggio #${msgCount} ricevuto alle ${ts}`;
-
-        // Mostra XML nel riquadro (ultimi 3 messaggi)
-        output.textContent = `<!-- Messaggio #${msgCount} – ${ts} -->\n` + event.data;
-        output.scrollTop = 0;
+        const ts = new Date().toLocaleTimeString('it-IT');
+        const busId = event.lastEventId || '?';
+        statusEl.textContent = `✅ Message #${msgCount} — bus ${busId} — ${ts}`;
+        output.textContent   = `<!-- Message #${msgCount} — bus ${busId} — ${ts} -->\n` + event.data;
+        output.scrollTop     = 0;
     });
 
-    es.addEventListener('info', (event) => {
-        output.textContent = event.data;
-    });
+    es.addEventListener('info', (event) => { output.textContent = event.data; });
 
     es.onerror = () => {
-        statusEl.textContent = '⚠️ Connessione SSE interrotta – riconnessione automatica...';
-        statusEl.className = 'waiting';
+        statusEl.textContent = '⚠️ SSE connection lost — reconnecting automatically…';
+        statusEl.className   = 'waiting';
     };
 }
 
 // =====================================================
-// Avvio
+// Startup
 // =====================================================
-loadRoute();
+loadRoutes();
 connectSse();
 updateStatus();
-setInterval(updateStatus, 5000);  // polling stato ogni 5 secondi
+setInterval(updateStatus, 5000);
 </script>
 </body>
 </html>
-
